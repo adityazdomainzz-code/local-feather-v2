@@ -1,0 +1,332 @@
+diff --git a/backend/app/Controllers/Admin/VmNodesController.php b/backend/app/Controllers/Admin/VmNodesController.php
+index ce29478..7928f01 100644
+--- a/backend/app/Controllers/Admin/VmNodesController.php
++++ b/backend/app/Controllers/Admin/VmNodesController.php
+@@ -412,6 +412,149 @@ class VmNodesController
+         return ApiResponse::success(['vm_node' => $safeNode], 'VM node created successfully', 201);
+     }
+ 
++    /**
++     * local-feather-v2: create a local KVM/libvirt VDS node from just a name.
++     *
++     * The panel asks the local node agent (running on the host, see setup.sh) to
++     * register a new node and hand back API credentials, then stores them as a
++     * regular VM node. No Proxmox host, FQDN or token has to be entered by hand.
++     */
++    public function createLocal(Request $request): Response
++    {
++        $admin = $request->attributes->get('user');
++        $data = json_decode($request->getContent(), true);
++        if (json_last_error() !== JSON_ERROR_NONE || !is_array($data)) {
++            return ApiResponse::error('Invalid JSON in request body', 'INVALID_JSON', 400);
++        }
++
++        $name = isset($data['name']) && is_string($data['name']) ? trim($data['name']) : '';
++        if ($name === '') {
++            return ApiResponse::error('Name is required', 'MISSING_REQUIRED_FIELDS', 400);
++        }
++        if (strlen($name) > 255) {
++            return ApiResponse::error('Name must be at most 255 characters', 'INVALID_DATA_LENGTH', 400);
++        }
++
++        $agentUrl = rtrim((string) (getenv('LOCAL_NODE_AGENT_URL') ?: 'http://host.docker.internal:8007'), '/');
++        $agentToken = (string) (getenv('LOCAL_NODE_AGENT_ADMIN_TOKEN') ?: '');
++        $agent = parse_url($agentUrl);
++        if ($agentToken === '' || !is_array($agent) || empty($agent['host'])) {
++            return ApiResponse::error('Local node agent is not configured. Run setup.sh from local-feather-v2 first.', 'LOCAL_NODE_NOT_CONFIGURED', 503);
++        }
++
++        foreach (VmNode::getAllVmNodes() as $existing) {
++            if (strcasecmp((string) ($existing['name'] ?? ''), $name) === 0) {
++                return ApiResponse::error('A VDS node with this name already exists', 'DUPLICATE_NAME', 409);
++            }
++        }
++
++        // Re-use (or create once) a VPS/VDS location called "Local".
++        $locationId = null;
++        foreach (Location::getAll('Local', 100, 0, 'vps') as $loc) {
++            if (strcasecmp((string) ($loc['name'] ?? ''), 'Local') === 0) {
++                $locationId = (int) $loc['id'];
++                break;
++            }
++        }
++        if ($locationId === null) {
++            $created = Location::create([
++                'name' => 'Local',
++                'description' => 'Local KVM/libvirt VDS nodes (created by local-feather-v2)',
++                'type' => 'vps',
++            ]);
++            if (!$created) {
++                return ApiResponse::error('Failed to create the Local location', 'LOCATION_CREATE_FAILED', 500);
++            }
++            $locationId = (int) $created;
++        }
++
++        $http = new \GuzzleHttp\Client(['timeout' => 60, 'http_errors' => false]);
++        $agentHeaders = ['Authorization' => 'Bearer ' . $agentToken, 'Accept' => 'application/json'];
++
++        try {
++            $resp = $http->post($agentUrl . '/local/nodes', ['headers' => $agentHeaders, 'json' => ['name' => $name]]);
++        } catch (\Throwable $e) {
++            App::getInstance(true)->getLogger()->error('Local node agent unreachable: ' . $e->getMessage());
++
++            return ApiResponse::error('Local node agent is not reachable. Is the local-feather-agent service running?', 'LOCAL_NODE_AGENT_UNREACHABLE', 502);
++        }
++
++        $agentBody = json_decode((string) $resp->getBody(), true);
++        $agentData = is_array($agentBody) ? ($agentBody['data'] ?? null) : null;
++        if (!in_array($resp->getStatusCode(), [200, 201], true) || !is_array($agentData)
++            || empty($agentData['token_id']) || empty($agentData['secret'])) {
++            $reason = is_array($agentBody) && isset($agentBody['error']) ? (string) $agentBody['error'] : 'HTTP ' . $resp->getStatusCode();
++            App::getInstance(true)->getLogger()->error('Local node agent refused node creation: ' . $reason);
++
++            return ApiResponse::error('Local node agent error: ' . $reason, 'LOCAL_NODE_AGENT_FAILED', 502);
++        }
++
++        $vmNodeId = VmNode::createVmNode([
++            'name' => $name,
++            'description' => 'Local KVM/libvirt node',
++            'location_id' => $locationId,
++            'fqdn' => (string) $agent['host'],
++            'scheme' => ($agent['scheme'] ?? 'http') === 'https' ? 'https' : 'http',
++            'port' => (int) ($agent['port'] ?? 8007),
++            'user' => (string) ($agentData['user'] ?? 'root@pam'),
++            'token_id' => (string) $agentData['token_id'],
++            'secret' => (string) $agentData['secret'],
++            'tls_no_verify' => 'true',
++            'timeout' => 120,
++        ]);
++
++        if (!$vmNodeId) {
++            // Do not leave an orphaned node behind in the agent.
++            try {
++                $http->delete($agentUrl . '/local/nodes/' . rawurlencode((string) ($agentData['node'] ?? $name)), ['headers' => $agentHeaders]);
++            } catch (\Throwable $e) {
++                App::getInstance(true)->getLogger()->error('Failed to roll back local node in agent: ' . $e->getMessage());
++            }
++
++            return ApiResponse::error('Failed to create VM node', 'VM_NODE_CREATE_FAILED', 400);
++        }
++
++        // Register the cloud-image templates the agent offers so the node is usable right away.
++        foreach (is_array($agentData['templates'] ?? null) ? $agentData['templates'] : [] as $tpl) {
++            if (!is_array($tpl) || !isset($tpl['vmid'], $tpl['name'])) {
++                continue;
++            }
++            try {
++                VmTemplate::create([
++                    'name' => (string) $tpl['name'],
++                    'description' => 'Local cloud image template',
++                    'guest_type' => 'qemu',
++                    'storage' => 'local',
++                    'template_file' => (string) (int) $tpl['vmid'],
++                    'vm_node_id' => (int) $vmNodeId,
++                    'is_active' => 'true',
++                ]);
++            } catch (\Throwable $e) {
++                App::getInstance(true)->getLogger()->error('Failed to register local template: ' . $e->getMessage());
++            }
++        }
++
++        $vmNode = VmNode::getVmNodeById($vmNodeId);
++
++        Activity::createActivity([
++            'user_uuid' => $admin['uuid'] ?? null,
++            'name' => 'create_vm_node',
++            'context' => 'Created local VM node: ' . ($vmNode['name'] ?? $name),
++            'ip_address' => CloudFlareRealIP::getRealIP(),
++        ]);
++
++        $safeNode = VmNode::sanitizeForAdminResponse($vmNode ?? []);
++
++        self::emitVdsEvent(VdsNodeEvent::onVdsNodeCreated(), [
++            'user_uuid' => $admin['uuid'] ?? null,
++            'vm_node_id' => (int) $vmNodeId,
++            'vm_node' => $safeNode,
++            'context' => ['source' => 'admin-local'],
++        ]);
++
++        return ApiResponse::success(['vm_node' => $safeNode], 'Local VM node created successfully', 201);
++    }
++
+     #[OA\Patch(
+         path: '/api/admin/vm-nodes/{id}',
+         summary: 'Update VM node',
+diff --git a/backend/app/routes/admin/vm-nodes.php b/backend/app/routes/admin/vm-nodes.php
+index 29dcf32..25efdd4 100644
+--- a/backend/app/routes/admin/vm-nodes.php
++++ b/backend/app/routes/admin/vm-nodes.php
+@@ -59,6 +59,18 @@ return function (RouteCollection $routes): void {
+         ['PUT']
+     );
+ 
++    // local-feather-v2: one-click local (KVM/libvirt) node. Only a name is needed.
++    App::getInstance(true)->registerAdminRoute(
++        $routes,
++        'admin-vm-nodes-create-local',
++        '/api/admin/vm-nodes/local',
++        function (Request $request) {
++            return (new VmNodesController())->createLocal($request);
++        },
++        Permissions::ADMIN_VM_NODES_CREATE,
++        ['POST']
++    );
++
+     App::getInstance(true)->registerAdminRoute(
+         $routes,
+         'admin-vm-nodes-update',
+diff --git a/frontendv2/public/locales/en.json b/frontendv2/public/locales/en.json
+index 6f8dd87..700a693 100644
+--- a/frontendv2/public/locales/en.json
++++ b/frontendv2/public/locales/en.json
+@@ -8020,6 +8020,15 @@
+         "vdsNodes": {
+             "title": "Nodes (VDS)",
+             "description": "Connect and manage Proxmox nodes for VPS / VDS virtualization.",
++            "local": {
++                "button": "Create Local Node",
++                "title": "Create Local Node",
++                "description": "Just enter a name. A local KVM node is set up on this machine automatically, and you can create as many VDS on it as you like.",
++                "name_placeholder": "Node name (e.g. local-1)",
++                "submit": "Create",
++                "success": "Local node created",
++                "failed": "Failed to create local node"
++            },
+             "viewAndManage": "View and manage VDS nodes in the location: {location}.",
+             "search_placeholder": "Search VDS nodes by name or FQDN...",
+             "tabs": {
+diff --git a/frontendv2/src/app/(app)/admin/vds-nodes/page.tsx b/frontendv2/src/app/(app)/admin/vds-nodes/page.tsx
+index 9334ce1..bb2699e 100644
+--- a/frontendv2/src/app/(app)/admin/vds-nodes/page.tsx
++++ b/frontendv2/src/app/(app)/admin/vds-nodes/page.tsx
+@@ -31,6 +31,13 @@ import { usePersistedListFilters } from '@/hooks/usePersistedListFilters';
+ import { WidgetRenderer } from '@/components/server/WidgetRenderer';
+ import { toast } from 'sonner';
+ import { getApiErrorMessage } from '@/lib/api-errors';
++import {
++    Dialog,
++    DialogHeader,
++    DialogTitleCustom as DialogTitle,
++    DialogDescription,
++    DialogFooter,
++} from '@/components/ui/dialog';
+ import { VdsCapacityOverview } from '@/components/admin/VdsCapacityOverview';
+ import {
+     Server,
+@@ -44,6 +51,7 @@ import {
+     Network,
+     Pencil,
+     HeartHandshakeIcon,
++    HardDrive,
+ } from 'lucide-react';
+ import { useIpMask } from '@/hooks/useIpMask';
+ import { ListPagination } from '@/components/featherui/ListPagination';
+@@ -117,6 +125,9 @@ export default function VdsNodesPage() {
+     const [refreshKey, setRefreshKey] = useState(0);
+     const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null);
+     const [deleting, setDeleting] = useState(false);
++    const [localDialogOpen, setLocalDialogOpen] = useState(false);
++    const [localNodeName, setLocalNodeName] = useState('');
++    const [creatingLocal, setCreatingLocal] = useState(false);
+ 
+     const [pagination, setPagination] = useState<Omit<Pagination, 'page' | 'pageSize'>>({
+         total: 0,
+@@ -250,6 +261,26 @@ export default function VdsNodesPage() {
+         }
+     };
+ 
++    const createLocalNode = async () => {
++        const name = localNodeName.trim();
++        if (!name || creatingLocal) {
++            return;
++        }
++        setCreatingLocal(true);
++        try {
++            await axios.post('/api/admin/vm-nodes/local', { name });
++            toast.success(t('admin.vdsNodes.local.success'));
++            setLocalDialogOpen(false);
++            setLocalNodeName('');
++            setRefreshKey((prev) => prev + 1);
++        } catch (error) {
++            console.error('Error creating local VM node:', error);
++            toast.error(getApiErrorMessage(error, t, 'admin.vdsNodes.local.failed'));
++        } finally {
++            setCreatingLocal(false);
++        }
++    };
++
+     const getLocationName = (locationId: number) => {
+         return locations.find((l) => l.id === locationId)?.name || t('common.unknown');
+     };
+@@ -287,6 +318,10 @@ export default function VdsNodesPage() {
+                             <Server className='mr-2 h-4 w-4' />
+                             {t('admin.vdsNodes.form.create_short')}
+                         </Button>
++                        <Button variant='outline' onClick={() => setLocalDialogOpen(true)}>
++                            <HardDrive className='mr-2 h-4 w-4' />
++                            {t('admin.vdsNodes.local.button')}
++                        </Button>
+                     </div>
+                 }
+             />
+@@ -326,10 +361,16 @@ export default function VdsNodesPage() {
+                     title={t('emptyStates.vdsNodes.title')}
+                     description={t('emptyStates.vdsNodes.description')}
+                     action={
+-                        <Button onClick={() => router.push('/admin/vds-nodes/create')}>
+-                            <Server className='mr-2 h-4 w-4' />
+-                            {t('admin.vdsNodes.form.create_short')}
+-                        </Button>
++                        <div className='flex flex-wrap items-center justify-center gap-2'>
++                            <Button onClick={() => router.push('/admin/vds-nodes/create')}>
++                                <Server className='mr-2 h-4 w-4' />
++                                {t('admin.vdsNodes.form.create_short')}
++                            </Button>
++                            <Button variant='outline' onClick={() => setLocalDialogOpen(true)}>
++                                <HardDrive className='mr-2 h-4 w-4' />
++                                {t('admin.vdsNodes.local.button')}
++                            </Button>
++                        </div>
+                     }
+                     filtered={isFiltered}
+                     onClearFilters={resetFilters}
+@@ -474,6 +515,39 @@ export default function VdsNodesPage() {
+             </TipCard>
+ 
+             <WidgetRenderer widgets={getWidgets('admin-vm-nodes', 'bottom-of-page')} />
++
++            <Dialog open={localDialogOpen} onClose={() => !creatingLocal && setLocalDialogOpen(false)}>
++                <DialogHeader>
++                    <DialogTitle>{t('admin.vdsNodes.local.title')}</DialogTitle>
++                    <DialogDescription>{t('admin.vdsNodes.local.description')}</DialogDescription>
++                </DialogHeader>
++
++                <div className='space-y-2 py-4'>
++                    <Input
++                        autoFocus
++                        placeholder={t('admin.vdsNodes.local.name_placeholder')}
++                        value={localNodeName}
++                        maxLength={255}
++                        onChange={(e) => setLocalNodeName(e.target.value)}
++                        onKeyDown={(e) => {
++                            if (e.key === 'Enter') {
++                                e.preventDefault();
++                                createLocalNode();
++                            }
++                        }}
++                        disabled={creatingLocal}
++                    />
++                </div>
++
++                <DialogFooter>
++                    <Button variant='outline' onClick={() => setLocalDialogOpen(false)} disabled={creatingLocal}>
++                        {t('common.cancel')}
++                    </Button>
++                    <Button onClick={createLocalNode} loading={creatingLocal} disabled={!localNodeName.trim()}>
++                        {t('admin.vdsNodes.local.submit')}
++                    </Button>
++                </DialogFooter>
++            </Dialog>
+         </div>
+     );
+ }
